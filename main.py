@@ -1,5 +1,9 @@
-from PyQt5 import QtWidgets, QtCore, QtGui
-import pydm
+import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+from PyQt5 import QtWidgets, QtCore
 from core import DesignerDisplay
 import pyqtgraph as pg
 import vmbpy as vm
@@ -18,6 +22,165 @@ def gaussian_fit(x, A, w, x0):
     return A * np.exp(-2 * ((x - x0) / w) ** 2)
 
 
+def fit_projection(pixel, intensity):
+    """Fit a 1/e^2 Gaussian radius to a one-dimensional projection."""
+    pixel = np.asarray(pixel, dtype=float)
+    intensity = np.asarray(intensity, dtype=float)
+    initial = (
+        float(np.max(intensity)),
+        max(float(len(pixel)) / 4, 1.0),
+        float(np.argmax(intensity)),
+    )
+    try:
+        parameters, _ = curve_fit(
+            gaussian_fit,
+            pixel,
+            intensity,
+            p0=initial,
+            maxfev=2000,
+        )
+    except (RuntimeError, ValueError, FloatingPointError):
+        return None, None
+
+    width = abs(float(parameters[1]))
+    return gaussian_fit(pixel, parameters[0], width, parameters[2]), width
+
+
+@dataclass
+class AnalysisResult:
+    frame: np.ndarray
+    row_pixel: np.ndarray
+    column_pixel: np.ndarray
+    row_sum: np.ndarray
+    column_sum: np.ndarray
+    row_fit: Optional[np.ndarray]
+    column_fit: Optional[np.ndarray]
+    row_width: Optional[float]
+    column_width: Optional[float]
+    centroid: Optional[tuple]
+    semimajor: Optional[float]
+    semiminor: Optional[float]
+    orientation: Optional[float]
+    ellipse_x: Optional[np.ndarray]
+    ellipse_y: Optional[np.ndarray]
+
+
+def analyze_frame(frame):
+    """Perform all CPU-heavy calculations for a camera frame."""
+    row_sum = np.sum(frame, axis=1)
+    column_sum = np.sum(frame, axis=0)
+    row_pixel = np.arange(len(row_sum))
+    column_pixel = np.arange(len(column_sum))
+    row_fit, row_width = fit_projection(row_pixel, row_sum)
+    column_fit, column_width = fit_projection(column_pixel, column_sum)
+
+    centroid = None
+    semimajor = None
+    semiminor = None
+    orientation = None
+    ellipse_x = None
+    ellipse_y = None
+
+    threshold = filters.threshold_otsu(frame)
+    foreground = (frame > threshold).astype(np.uint8)
+    properties = regionprops(foreground, frame)
+    if properties:
+        prop = properties[0]
+        centroid = (
+            float(prop.weighted_centroid[1]),
+            float(prop.weighted_centroid[0]),
+        )
+        orientation = -float(prop.orientation + (np.pi / 2))
+        semimajor = float(prop.axis_major_length / 2)
+        semiminor = float(prop.axis_minor_length / 2)
+
+        angle = np.linspace(0, 2 * np.pi, 100)
+        ellipse = np.array(
+            [semimajor * np.cos(angle), semiminor * np.sin(angle)]
+        )
+        rotation = np.array(
+            [
+                [np.cos(orientation), -np.sin(orientation)],
+                [np.sin(orientation), np.cos(orientation)],
+            ]
+        )
+        rotated = rotation @ ellipse
+        ellipse_x = centroid[0] + rotated[0]
+        ellipse_y = centroid[1] + rotated[1]
+
+    return AnalysisResult(
+        frame=frame,
+        row_pixel=row_pixel,
+        column_pixel=column_pixel,
+        row_sum=row_sum,
+        column_sum=column_sum,
+        row_fit=row_fit,
+        column_fit=column_fit,
+        row_width=row_width,
+        column_width=column_width,
+        centroid=centroid,
+        semimajor=semimajor,
+        semiminor=semiminor,
+        orientation=orientation,
+        ellipse_x=ellipse_x,
+        ellipse_y=ellipse_y,
+    )
+
+
+class AcquisitionWorker(QtCore.QObject):
+    """Acquire frames without blocking Qt's GUI event loop."""
+
+    frame_ready = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, max_update_hz=30):
+        super().__init__()
+        self.minimum_emit_interval = 1 / max_update_hz
+        self._stop_requested = threading.Event()
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        last_emit = 0.0
+        try:
+            vmb = vm.VmbSystem.get_instance()
+            with vmb:
+                cameras = vmb.get_all_cameras()
+                if not cameras:
+                    raise RuntimeError("No Allied Vision camera was detected.")
+                with cameras[0] as camera:
+                    while not self._stop_requested.is_set():
+                        frame = camera.get_frame()
+                        now = time.monotonic()
+                        if now - last_emit < self.minimum_emit_interval:
+                            continue
+                        # Own the data before Vimba recycles its frame buffer.
+                        array = frame.as_numpy_ndarray()[:, :, 0].copy()
+                        self.frame_ready.emit(array)
+                        last_emit = now
+        except Exception as exc:
+            self.error.emit(f"Camera acquisition stopped: {exc}")
+        finally:
+            self.finished.emit()
+
+    def request_stop(self):
+        self._stop_requested.set()
+
+
+class AnalysisWorker(QtCore.QObject):
+    """Run image fitting and region analysis on a dedicated thread."""
+
+    result_ready = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+
+    @QtCore.pyqtSlot(object)
+    def analyze(self, frame):
+        try:
+            self.result_ready.emit(analyze_frame(frame))
+        except Exception as exc:
+            self.error.emit(f"Frame analysis failed: {exc}")
+
+
 class MplCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         fig = Figure(figsize=(width, height), dpi=dpi)
@@ -27,6 +190,7 @@ class MplCanvas(FigureCanvasQTAgg):
 
 class Viewer(DesignerDisplay, QtWidgets.QWidget):
     filename = "viewer.ui"
+    analyze_requested = QtCore.pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -44,134 +208,152 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.left_plot.axes.invert_yaxis()
         self.LeftPlotLayout.addWidget(self.left_plot)
         self.TopPlotLayout.addWidget(self.top_plot)
-        self.curve = None
-        self.crosshair = None
-        self.ellipse_pen = pg.mkPen(color="w", width=3)
-        self.t = np.linspace(0, 2 * np.pi, 100)
-        self.vmb = vm.VmbSystem.get_instance()
-        with self.vmb:
-            self.cam = self.vmb.get_all_cameras()[0]
-            with self.cam:
-                frame = self.cam.get_frame()
-                arr = frame.as_numpy_ndarray()[:, :, 0]
-        self.ImageView.setImage(arr)
-        sumx = np.sum(arr, 1)
-        sumy = np.sum(arr, 0)
-        self.x_pixel = range(len(sumx))
-        self.y_pixel = range(len(sumy))
-        self.left_plot_data = self.left_plot.axes.plot(sumx, self.x_pixel)[0]
-        self.top_plot_data = self.top_plot.axes.plot(self.y_pixel, sumy)[0]
-        self.left_plot_fit = self.left_plot.axes.plot(sumx, self.x_pixel)[0]
-        self.top_plot_fit = self.top_plot.axes.plot(sumy)[0]
-        self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.update_cb)
-        self.RefGroupBox.setVisible(False)
-        self.update_cb()
-
-    def update_cb(self):
-        """
-        callback method to update viewer image
-        """
-
-        # Get image array from camera and send to viewer
-        with self.vmb:
-            with self.cam:
-                frame = self.cam.get_frame()
-                arr = frame.as_numpy_ndarray()[:, :, 0]
-        self.ImageView.setImage(arr)
-
-        # Gaussian fit plots and calculations
-        sumx = np.sum(arr, 1)
-        sumy = np.sum(arr, 0)
-        self.left_plot_data.set_data(sumx, self.x_pixel)
-        self.top_plot_data.set_data(self.y_pixel, sumy)
-        try:
-            left_parameters, _ = curve_fit(gaussian_fit, self.x_pixel, sumx)
-            self.left_plot_fit.set_xdata(
-                gaussian_fit(
-                    self.x_pixel,
-                    left_parameters[0],
-                    left_parameters[1],
-                    left_parameters[2],
-                )
-            )
-            self.wyPixelLabel.setText(f"{left_parameters[1]:.2f}")
-            self.wymmLabel.setText(
-                f"{left_parameters[1]*self.pixel_um_conversion/1000:.2f}"
-            )
-        except RuntimeError:
-            pass
-        try:
-            top_parameters, _ = curve_fit(gaussian_fit, self.y_pixel, sumy)
-            self.top_plot_fit.set_ydata(
-                gaussian_fit(
-                    self.y_pixel,
-                    top_parameters[0],
-                    top_parameters[1],
-                    top_parameters[2],
-                )
-            )
-            self.wxPixelLabel.setText(f"{top_parameters[1]:.2f}")
-            self.wxmmLabel.setText(
-                f"{top_parameters[1]*self.pixel_um_conversion/1000:.2f}"
-            )
-        except RuntimeError:
-            pass
-        self.left_plot.draw_idle()
-        self.top_plot.draw_idle()
-
-        # Ellipse outline and centroid calculation and display
-        threshold_val = filters.threshold_otsu(arr)
-        labeled_foreground = (arr > threshold_val).astype(int)
-        properties = regionprops(labeled_foreground, arr)
-        com_x, com_y = (
-            properties[0].weighted_centroid[1],
-            properties[0].weighted_centroid[0],
-        )
-        orientation = -1 * (properties[0].orientation + (np.pi / 2))
-        semimajor = properties[0].axis_major_length / 2
-        semiminor = properties[0].axis_minor_length / 2
-        Ell = np.array(
-            [
-                semimajor * np.cos(self.t),
-                semiminor * np.sin(self.t),
-            ]
-        )
-        Ell_rot = np.zeros((2, Ell.shape[1]))
-        t_rot = orientation
-        R_rot = np.array(
-            [
-                [np.cos(t_rot), -1 * np.sin(t_rot)],
-                [np.sin(t_rot), np.cos(t_rot)],
-            ]
-        )
-        for i in range(Ell.shape[1]):
-            Ell_rot[:, i] = np.dot(R_rot, Ell[:, i])
-        x = com_x + Ell_rot[0, :]
-        y = com_y + Ell_rot[1, :]
-        if self.curve is not None:
-            self.ImageView.removeItem(self.curve)
-        if self.crosshair is not None:
-            self.ImageView.removeItem(self.crosshair)
-        self.curve = pg.PlotCurveItem(x=x, y=y, pen=self.ellipse_pen)
+        self.curve = pg.PlotCurveItem(pen=pg.mkPen(color="w", width=3))
         self.crosshair = pg.ScatterPlotItem(
-            pos=[(com_x, com_y)],
-            symbol="+",
-            pen=self.ellipse_pen,
+            symbol="+", pen=pg.mkPen(color="w", width=3)
         )
         self.ImageView.addItem(self.curve)
         self.ImageView.addItem(self.crosshair)
+        self.left_plot_data = self.left_plot.axes.plot([], [])[0]
+        self.top_plot_data = self.top_plot.axes.plot([], [])[0]
+        self.left_plot_fit = self.left_plot.axes.plot([], [])[0]
+        self.top_plot_fit = self.top_plot.axes.plot([], [])[0]
+        self._analysis_busy = False
+        self._pending_frame = None
+        self._stopping = False
+        self.RefGroupBox.setVisible(False)
+        self._start_workers()
+
+    def _start_workers(self):
+        self.analysis_thread = QtCore.QThread(self)
+        self.analysis_worker = AnalysisWorker()
+        self.analysis_worker.moveToThread(self.analysis_thread)
+        self.analyze_requested.connect(self.analysis_worker.analyze)
+        self.analysis_worker.result_ready.connect(self._render_result)
+        self.analysis_worker.error.connect(self._analysis_failed)
+        self.analysis_thread.finished.connect(self.analysis_worker.deleteLater)
+        self.analysis_thread.start()
+
+        self.acquisition_thread = QtCore.QThread(self)
+        self.acquisition_worker = AcquisitionWorker(max_update_hz=30)
+        self.acquisition_worker.moveToThread(self.acquisition_thread)
+        self.acquisition_thread.started.connect(self.acquisition_worker.run)
+        self.acquisition_worker.frame_ready.connect(self._queue_frame)
+        self.acquisition_worker.error.connect(self._show_error)
+        self.acquisition_worker.finished.connect(self.acquisition_thread.quit)
+        self.acquisition_worker.finished.connect(self.acquisition_worker.deleteLater)
+        self.acquisition_thread.start()
+
+    @QtCore.pyqtSlot(object)
+    def _queue_frame(self, frame):
+        if self._stopping:
+            return
+        if self._analysis_busy:
+            self._pending_frame = frame
+            return
+        self._analysis_busy = True
+        self.analyze_requested.emit(frame)
+
+    @QtCore.pyqtSlot(object)
+    def _render_result(self, result):
+        if self._stopping:
+            return
+
+        self.ImageView.setImage(result.frame)
+        self.left_plot_data.set_data(result.row_sum, result.row_pixel)
+        self.top_plot_data.set_data(result.column_pixel, result.column_sum)
+        self.left_plot_fit.set_data(
+            result.row_fit if result.row_fit is not None else [],
+            result.row_pixel if result.row_fit is not None else [],
+        )
+        self.top_plot_fit.set_data(
+            result.column_pixel if result.column_fit is not None else [],
+            result.column_fit if result.column_fit is not None else [],
+        )
+
+        row_max = max(float(np.max(result.row_sum)), 1.0)
+        column_max = max(float(np.max(result.column_sum)), 1.0)
+        self.left_plot.axes.set_xlim(row_max * 1.05, 0)
+        self.left_plot.axes.set_ylim(len(result.row_pixel) - 1, 0)
+        self.top_plot.axes.set_xlim(0, len(result.column_pixel) - 1)
+        self.top_plot.axes.set_ylim(0, column_max * 1.05)
+        self.left_plot.draw_idle()
+        self.top_plot.draw_idle()
+
+        self._set_width_labels(result)
+        self._set_region_labels(result)
+        self.MiscLabel.setText("")
+        self._analysis_busy = False
+        self._dispatch_pending_frame()
+
+    def _set_width_labels(self, result):
+        if result.row_width is not None:
+            self.wyPixelLabel.setText(f"{result.row_width:.2f}")
+            self.wymmLabel.setText(
+                f"{result.row_width * self.pixel_um_conversion / 1000:.2f}"
+            )
+        if result.column_width is not None:
+            self.wxPixelLabel.setText(f"{result.column_width:.2f}")
+            self.wxmmLabel.setText(
+                f"{result.column_width * self.pixel_um_conversion / 1000:.2f}"
+            )
+
+    def _set_region_labels(self, result):
+        if result.centroid is None:
+            self.curve.setData([], [])
+            self.crosshair.setData(pos=[])
+            self.CentroidLabel.setText("No foreground detected")
+            self.SemimajorLabel.setText("--")
+            self.SemiminorLabel.setText("--")
+            self.OrientationLabel.setText("--")
+            return
+
+        com_x, com_y = result.centroid
+        self.curve.setData(result.ellipse_x, result.ellipse_y)
+        self.crosshair.setData(pos=[(com_x, com_y)])
         self.CentroidLabel.setText(
-            f"Pixel ({com_x:.2f}, {com_y:.2f}); mm ({com_x*self.pixel_um_conversion/1000:.2f}, {com_y*self.pixel_um_conversion/1000:.2f})"
+            f"Pixel ({com_x:.2f}, {com_y:.2f}); mm "
+            f"({com_x * self.pixel_um_conversion / 1000:.2f}, "
+            f"{com_y * self.pixel_um_conversion / 1000:.2f})"
         )
         self.SemimajorLabel.setText(
-            f"Pixel: {semimajor:.2f}; mm: {semimajor*self.pixel_um_conversion/1000:.2f}"
+            f"Pixel: {result.semimajor:.2f}; mm: "
+            f"{result.semimajor * self.pixel_um_conversion / 1000:.2f}"
         )
         self.SemiminorLabel.setText(
-            f"Pixel: {semiminor:.2f}; mm: {semiminor*self.pixel_um_conversion/1000:.2f}"
+            f"Pixel: {result.semiminor:.2f}; mm: "
+            f"{result.semiminor * self.pixel_um_conversion / 1000:.2f}"
         )
-        self.OrientationLabel.setText(f"{orientation:.2f}")
-        self.timer.start(10)
+        self.OrientationLabel.setText(f"{result.orientation:.2f}")
+
+    @QtCore.pyqtSlot(str)
+    def _analysis_failed(self, message):
+        self._show_error(message)
+        self._analysis_busy = False
+        self._dispatch_pending_frame()
+
+    def _dispatch_pending_frame(self):
+        if self._pending_frame is None or self._stopping:
+            return
+        frame = self._pending_frame
+        self._pending_frame = None
+        self._analysis_busy = True
+        self.analyze_requested.emit(frame)
+
+    @QtCore.pyqtSlot(str)
+    def _show_error(self, message):
+        self.MiscLabel.setText(message)
+
+    def closeEvent(self, event):
+        self._stopping = True
+        self._pending_frame = None
+        if self.acquisition_thread.isRunning():
+            self.acquisition_worker.request_stop()
+        self.acquisition_thread.quit()
+        self.analysis_thread.quit()
+        self.acquisition_thread.wait(5000)
+        self.analysis_thread.wait(5000)
+        super().closeEvent(event)
 
     # def add_menubar(self, widget: QtWidgets.QWidget):
     #     """
