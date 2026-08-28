@@ -288,17 +288,18 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         # self. add_menubar(self.ImageWidget)
         self.left_plot = MplCanvas(self, width=2, height=5)
         self.left_plot.setSizePolicy(
-            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Minimum
+            QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding
         )
         self.top_plot = MplCanvas(self, width=5, height=2)
         self.top_plot.setSizePolicy(
-            QtWidgets.QSizePolicy.Minimum, QtWidgets.QSizePolicy.Minimum
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
         )
+        self.left_plot.setFixedWidth(190)
+        self.top_plot.setFixedHeight(155)
         self.pixel_um_conversion = 2.2
         self.left_plot.axes.invert_xaxis()
         self.left_plot.axes.invert_yaxis()
-        self.LeftPlotLayout.addWidget(self.left_plot)
-        self.TopPlotLayout.addWidget(self.top_plot)
+        self._build_projection_layout()
         self.curve = pg.PlotCurveItem(pen=pg.mkPen(color="w", width=3))
         self.crosshair = pg.ScatterPlotItem(
             symbol="+", pen=pg.mkPen(color="w", width=3)
@@ -321,6 +322,51 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.RefGroupBox.setVisible(False)
         self._build_runtime_controls()
         self._start_workers()
+
+    def _build_projection_layout(self):
+        """Align each projection canvas with the matching image dimension."""
+        # Use the full canvas extent along the shared dimension. This makes the
+        # top X axis and side Y axis physically span the same width/height as
+        # the image widget, in addition to having matching numeric limits.
+        self.top_plot.figure.subplots_adjust(
+            left=0.0, right=1.0, bottom=0.25, top=0.95
+        )
+        self.left_plot.figure.subplots_adjust(
+            left=0.28, right=0.95, bottom=0.0, top=1.0
+        )
+
+        # The Designer layout placed the side plot beside a container holding
+        # the top plot, image, and status bar, so its height could never match
+        # the image. Rebuild that portion as one shared grid.
+        first_item = self.horizontalLayout.takeAt(0)
+        old_left_layout = first_item.layout() if first_item is not None else None
+        if old_left_layout is not None:
+            old_left_layout.setParent(None)
+            old_left_layout.deleteLater()
+
+        while self.verticalLayout_3.count():
+            item = self.verticalLayout_3.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                child_layout.setParent(None)
+                child_layout.deleteLater()
+
+        self.ImageWidget.hide()
+        projection_widget = QtWidgets.QWidget(self.frame_4)
+        projection_grid = QtWidgets.QGridLayout(projection_widget)
+        projection_grid.setContentsMargins(0, 0, 0, 0)
+        projection_grid.setHorizontalSpacing(6)
+        projection_grid.setVerticalSpacing(6)
+        projection_grid.addWidget(self.top_plot, 0, 1)
+        projection_grid.addWidget(self.left_plot, 1, 0)
+        projection_grid.addWidget(self.ImageView, 1, 1)
+        projection_grid.addWidget(self.frame_3, 2, 1)
+        projection_grid.setColumnStretch(0, 0)
+        projection_grid.setColumnStretch(1, 1)
+        projection_grid.setRowStretch(0, 0)
+        projection_grid.setRowStretch(1, 1)
+        projection_grid.setRowStretch(2, 0)
+        self.verticalLayout_3.addWidget(projection_widget)
 
     def _build_runtime_controls(self):
         controls = QtWidgets.QGroupBox("Runtime controls", self.ImageGroupBox)
@@ -596,8 +642,16 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         row_max = max(float(np.max(result.row_sum)), 1.0)
         column_max = max(float(np.max(result.column_sum)), 1.0)
         self.left_plot.axes.set_xlim(row_max * 1.05, 0)
-        self.left_plot.axes.set_ylim(len(result.row_pixel) - 1, 0)
-        self.top_plot.axes.set_xlim(0, len(result.column_pixel) - 1)
+        # Pixel coordinates refer to centers. Half-pixel bounds give each
+        # projection axis the same full pixel extent as the image.
+        self.left_plot.axes.set_ylim(
+            len(result.row_pixel) - 0.5,
+            -0.5,
+        )
+        self.top_plot.axes.set_xlim(
+            -0.5,
+            len(result.column_pixel) - 0.5,
+        )
         self.top_plot.axes.set_ylim(0, column_max * 1.05)
         self.left_plot.draw_idle()
         self.top_plot.draw_idle()
