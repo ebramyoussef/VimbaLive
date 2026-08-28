@@ -14,8 +14,8 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 
-def gaussian_fit(x, A, w, x0):
-    return A * np.exp(-2 * ((x - x0) / w) ** 2)
+def gaussian_fit(x, A, w, x0, B):
+    return A * np.exp(-2 * ((x - x0) / w) ** 2) + B
 
 
 class MplCanvas(FigureCanvasQTAgg):
@@ -93,6 +93,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
                     left_parameters[0],
                     left_parameters[1],
                     left_parameters[2],
+                    left_parameters[3],
                 )
             )
             self.wyPixelLabel.setText(f"{left_parameters[1]:.2f}")
@@ -109,6 +110,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
                     top_parameters[0],
                     top_parameters[1],
                     top_parameters[2],
+                    top_parameters[3],
                 )
             )
             self.wxPixelLabel.setText(f"{top_parameters[1]:.2f}")
