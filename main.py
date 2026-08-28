@@ -175,6 +175,9 @@ class AcquisitionWorker(QtCore.QObject):
     """Acquire frames without blocking Qt's GUI event loop."""
 
     frame_ready = QtCore.pyqtSignal(object)
+    camera_controls_ready = QtCore.pyqtSignal(object)
+    camera_settings_applied = QtCore.pyqtSignal(object)
+    warning = QtCore.pyqtSignal(str)
     error = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
@@ -183,6 +186,8 @@ class AcquisitionWorker(QtCore.QObject):
         self.camera_id = camera_id
         self._rate_lock = threading.Lock()
         self._minimum_emit_interval = 1 / max_update_hz
+        self._settings_lock = threading.Lock()
+        self._pending_camera_settings = None
         self._stop_requested = threading.Event()
 
     @QtCore.pyqtSlot(float)
@@ -190,6 +195,93 @@ class AcquisitionWorker(QtCore.QObject):
         """This slot may be called directly; only mutate lock-protected state."""
         with self._rate_lock:
             self._minimum_emit_interval = 1 / max(float(max_update_hz), 0.1)
+
+    @QtCore.pyqtSlot(object)
+    def queue_camera_settings(self, settings):
+        """Store only the latest requested values for the acquisition loop."""
+        with self._settings_lock:
+            self._pending_camera_settings = dict(settings)
+
+    @staticmethod
+    def _numeric_feature_info(camera, name):
+        try:
+            feature = camera.get_feature_by_name(name)
+            minimum, maximum = feature.get_range()
+            try:
+                increment = feature.get_increment()
+            except Exception:
+                increment = 1
+            return {
+                "available": True,
+                "writable": bool(feature.is_writeable()),
+                "minimum": minimum,
+                "maximum": maximum,
+                "increment": increment,
+                "value": feature.get(),
+            }
+        except Exception:
+            return {"available": False, "writable": False}
+
+    def _camera_control_info(self, camera):
+        return {
+            "exposure": self._numeric_feature_info(camera, "ExposureTime"),
+            "binning_x": self._numeric_feature_info(camera, "BinningHorizontal"),
+            "binning_y": self._numeric_feature_info(camera, "BinningVertical"),
+        }
+
+    @staticmethod
+    def _set_numeric_feature(camera, name, requested_value):
+        feature = camera.get_feature_by_name(name)
+        minimum, maximum = feature.get_range()
+        value = min(max(requested_value, minimum), maximum)
+        try:
+            increment = feature.get_increment()
+        except Exception:
+            increment = 0
+        if increment:
+            value = minimum + round((value - minimum) / increment) * increment
+        feature.set(value)
+        return feature.get()
+
+    def _apply_pending_camera_settings(self, camera):
+        with self._settings_lock:
+            settings = self._pending_camera_settings
+            self._pending_camera_settings = None
+        if not settings:
+            return
+
+        failures = []
+        applied = {}
+        if "exposure" in settings:
+            try:
+                # A numeric exposure request is explicitly a manual setting.
+                try:
+                    camera.get_feature_by_name("ExposureAuto").set("Off")
+                except Exception:
+                    pass
+                applied["exposure"] = self._set_numeric_feature(
+                    camera, "ExposureTime", settings["exposure"]
+                )
+            except Exception as exc:
+                failures.append(f"exposure: {exc}")
+
+        for key, feature_name in (
+            ("binning_x", "BinningHorizontal"),
+            ("binning_y", "BinningVertical"),
+        ):
+            if key not in settings:
+                continue
+            try:
+                applied[key] = self._set_numeric_feature(
+                    camera, feature_name, settings[key]
+                )
+            except Exception as exc:
+                failures.append(f"{key}: {exc}")
+
+        if applied:
+            self.camera_settings_applied.emit(applied)
+        if failures:
+            self.warning.emit("Camera setting failed — " + "; ".join(failures))
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -206,7 +298,9 @@ class AcquisitionWorker(QtCore.QObject):
                     else cameras[0]
                 )
                 with camera:
+                    self.camera_controls_ready.emit(self._camera_control_info(camera))
                     while not self._stop_requested.is_set():
+                        self._apply_pending_camera_settings(camera)
                         frame = camera.get_frame()
                         now = time.monotonic()
                         with self._rate_lock:
@@ -281,6 +375,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
     filename = "viewer.ui"
     analyze_requested = QtCore.pyqtSignal(object)
     acquisition_rate_changed = QtCore.pyqtSignal(float)
+    camera_settings_changed = QtCore.pyqtSignal(object)
     acquisition_stop_requested = QtCore.pyqtSignal()
 
     def __init__(self):
@@ -424,6 +519,23 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.FlipXCheckBox = QtWidgets.QCheckBox("Flip X", controls)
         self.FlipYCheckBox = QtWidgets.QCheckBox("Flip Y", controls)
 
+        self.ExposureSpinBox = QtWidgets.QDoubleSpinBox(controls)
+        self.ExposureSpinBox.setRange(1.0, 10000000.0)
+        self.ExposureSpinBox.setDecimals(2)
+        self.ExposureSpinBox.setSuffix(" µs")
+        self.ExposureSpinBox.setEnabled(False)
+        self.ExposureSpinBox.setToolTip(
+            "Manual camera exposure time. Its supported range is read from the camera."
+        )
+        self.BinningXSpinBox = QtWidgets.QSpinBox(controls)
+        self.BinningYSpinBox = QtWidgets.QSpinBox(controls)
+        for spin_box in (self.BinningXSpinBox, self.BinningYSpinBox):
+            spin_box.setRange(1, 16)
+            spin_box.setEnabled(False)
+            spin_box.setToolTip(
+                "Sensor binning. Its supported range is read from the camera."
+            )
+
         layout.addWidget(QtWidgets.QLabel("Camera:"), 0, 0)
         layout.addWidget(self.CameraComboBox, 0, 1, 1, 3)
         layout.addWidget(self.RefreshCamerasButton, 0, 4)
@@ -443,6 +555,12 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         layout.addWidget(self.FlipYCheckBox, 2, 5)
         layout.addWidget(QtWidgets.QLabel("Fit evaluations:"), 2, 6)
         layout.addWidget(self.FitEvaluationsSpinBox, 2, 7)
+        layout.addWidget(QtWidgets.QLabel("Exposure:"), 3, 0)
+        layout.addWidget(self.ExposureSpinBox, 3, 1)
+        layout.addWidget(QtWidgets.QLabel("Horizontal binning:"), 3, 2)
+        layout.addWidget(self.BinningXSpinBox, 3, 3)
+        layout.addWidget(QtWidgets.QLabel("Vertical binning:"), 3, 4)
+        layout.addWidget(self.BinningYSpinBox, 3, 5)
         layout.setColumnStretch(7, 1)
         self.verticalLayout_8.insertWidget(0, controls)
 
@@ -455,7 +573,85 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.ThresholdComboBox.currentTextChanged.connect(
             lambda text: self.ManualThresholdSpinBox.setEnabled(text == "Manual")
         )
+        self.ExposureSpinBox.valueChanged.connect(self._camera_settings_changed)
+        self.BinningXSpinBox.valueChanged.connect(self._camera_settings_changed)
+        self.BinningYSpinBox.valueChanged.connect(self._camera_settings_changed)
         self._update_rate_changed(self.UpdateRateSpinBox.value())
+
+    def _set_camera_controls_enabled(self, enabled):
+        for spin_box in (
+            self.ExposureSpinBox,
+            self.BinningXSpinBox,
+            self.BinningYSpinBox,
+        ):
+            spin_box.setEnabled(enabled and spin_box.property("cameraWritable") is True)
+
+    @QtCore.pyqtSlot(object)
+    def _configure_camera_controls(self, controls):
+        if self.acquisition_thread is None or not self.acquisition_thread.isRunning():
+            return
+        specifications = (
+            (self.ExposureSpinBox, controls["exposure"], False),
+            (self.BinningXSpinBox, controls["binning_x"], True),
+            (self.BinningYSpinBox, controls["binning_y"], True),
+        )
+        for spin_box, feature, integer_value in specifications:
+            writable = feature.get("available", False) and feature.get(
+                "writable", False
+            )
+            spin_box.setProperty("cameraWritable", writable)
+            spin_box.blockSignals(True)
+            if feature.get("available", False):
+                minimum = feature["minimum"]
+                maximum = feature["maximum"]
+                increment = feature.get("increment") or 1
+                if integer_value:
+                    spin_box.setRange(int(minimum), int(maximum))
+                    spin_box.setSingleStep(max(1, int(increment)))
+                    spin_box.setValue(int(feature["value"]))
+                else:
+                    spin_box.setRange(float(minimum), float(maximum))
+                    spin_box.setSingleStep(max(float(increment), 0.001))
+                    spin_box.setValue(float(feature["value"]))
+                spin_box.setToolTip(
+                    f"Camera range: {minimum:g} to {maximum:g}; "
+                    f"increment: {increment:g}."
+                )
+            else:
+                spin_box.setToolTip("This feature is not supported by the selected camera.")
+            spin_box.blockSignals(False)
+            spin_box.setEnabled(writable)
+
+    @QtCore.pyqtSlot()
+    def _camera_settings_changed(self):
+        settings = {}
+        if self.ExposureSpinBox.isEnabled():
+            settings["exposure"] = self.ExposureSpinBox.value()
+        if self.BinningXSpinBox.isEnabled():
+            settings["binning_x"] = self.BinningXSpinBox.value()
+        if self.BinningYSpinBox.isEnabled():
+            settings["binning_y"] = self.BinningYSpinBox.value()
+        if settings:
+            self.camera_settings_changed.emit(settings)
+
+    @QtCore.pyqtSlot(object)
+    def _update_applied_camera_values(self, values):
+        widgets = {
+            "exposure": self.ExposureSpinBox,
+            "binning_x": self.BinningXSpinBox,
+            "binning_y": self.BinningYSpinBox,
+        }
+        for key, value in values.items():
+            spin_box = widgets[key]
+            spin_box.blockSignals(True)
+            spin_box.setValue(value)
+            spin_box.blockSignals(False)
+        self.CameraStatusLabel.setText("Running")
+
+    @QtCore.pyqtSlot(str)
+    def _show_camera_warning(self, message):
+        self.CameraStatusLabel.setText("Setting rejected")
+        self.MiscLabel.setText(message)
 
     def _analysis_settings(self):
         return AnalysisSettings(
@@ -556,6 +752,13 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.acquisition_worker.moveToThread(self.acquisition_thread)
         self.acquisition_thread.started.connect(self.acquisition_worker.run)
         self.acquisition_worker.frame_ready.connect(self._queue_frame)
+        self.acquisition_worker.camera_controls_ready.connect(
+            self._configure_camera_controls
+        )
+        self.acquisition_worker.camera_settings_applied.connect(
+            self._update_applied_camera_values
+        )
+        self.acquisition_worker.warning.connect(self._show_camera_warning)
         self.acquisition_worker.error.connect(self._show_error)
         self.acquisition_worker.finished.connect(self.acquisition_thread.quit)
         self.acquisition_worker.finished.connect(self.acquisition_worker.deleteLater)
@@ -569,6 +772,11 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
             self.acquisition_worker.request_stop,
             type=QtCore.Qt.DirectConnection,
         )
+        self.camera_settings_changed.connect(
+            self.acquisition_worker.queue_camera_settings,
+            type=QtCore.Qt.DirectConnection,
+        )
+        self._set_camera_controls_enabled(False)
         self.StartButton.setEnabled(False)
         self.StopButton.setEnabled(True)
         self.RefreshCamerasButton.setEnabled(False)
@@ -599,6 +807,9 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         try:
             self.acquisition_rate_changed.disconnect(self.acquisition_worker.set_max_update_hz)
             self.acquisition_stop_requested.disconnect(self.acquisition_worker.request_stop)
+            self.camera_settings_changed.disconnect(
+                self.acquisition_worker.queue_camera_settings
+            )
         except (TypeError, RuntimeError):
             pass
         self.acquisition_thread = None
@@ -606,6 +817,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.StartButton.setEnabled(True)
         self.StopButton.setEnabled(False)
         self.RefreshCamerasButton.setEnabled(True)
+        self._set_camera_controls_enabled(False)
         if self._restart_acquisition and not self._stopping:
             self._restart_acquisition = False
             self._start_acquisition()
