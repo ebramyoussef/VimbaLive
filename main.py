@@ -705,6 +705,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.SaveCurrentButton = QtWidgets.QPushButton("Save current image…", controls)
         self.SaveCurrentButton.setEnabled(False)
         self.SaveStatusLabel = QtWidgets.QLabel("No image saved yet", controls)
+        self.SaveStatusLabel.setWordWrap(True)
 
         layout.addWidget(self.PeriodicSaveCheckBox, 0, 0)
         layout.addWidget(QtWidgets.QLabel("Interval:"), 0, 1)
