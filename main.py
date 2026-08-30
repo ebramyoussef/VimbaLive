@@ -21,18 +21,22 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 
-def gaussian_fit(x, A, w, x0):
-    return A * np.exp(-2 * ((x - x0) / w) ** 2)
+def gaussian_fit(x, A, w, x0, D):
+    """Gaussian with a constant background and a 1/e^2 radius ``w``."""
+    return A * np.exp(-2 * ((x - x0) / w) ** 2) + D
 
 
 def fit_projection(pixel, intensity, max_evaluations=2000):
-    """Fit a 1/e^2 Gaussian radius to a one-dimensional projection."""
+    """Fit a Gaussian plus DC offset to a one-dimensional projection."""
     pixel = np.asarray(pixel, dtype=float)
     intensity = np.asarray(intensity, dtype=float)
+    baseline = float(np.percentile(intensity, 10))
+    peak = float(np.max(intensity))
     initial = (
-        float(np.max(intensity)),
+        max(peak - baseline, np.finfo(float).eps),
         max(float(len(pixel)) / 4, 1.0),
         float(np.argmax(intensity)),
+        baseline,
     )
     try:
         parameters, _ = curve_fit(
@@ -46,7 +50,10 @@ def fit_projection(pixel, intensity, max_evaluations=2000):
         return None, None
 
     width = abs(float(parameters[1]))
-    return gaussian_fit(pixel, parameters[0], width, parameters[2]), width
+    return (
+        gaussian_fit(pixel, parameters[0], width, parameters[2], parameters[3]),
+        width,
+    )
 
 
 @dataclass
