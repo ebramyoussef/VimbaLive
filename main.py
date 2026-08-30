@@ -1,6 +1,9 @@
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from PyQt5 import QtWidgets, QtCore
@@ -83,6 +86,13 @@ class AnalysisSettings:
 class AnalysisJob:
     frame: np.ndarray
     settings: AnalysisSettings
+
+
+@dataclass(frozen=True)
+class ImageSaveJob:
+    frame: np.ndarray
+    path: str
+    periodic: bool = False
 
 
 def analyze_frame(frame, settings=None):
@@ -189,6 +199,7 @@ class AcquisitionWorker(QtCore.QObject):
         self._settings_lock = threading.Lock()
         self._pending_camera_settings = None
         self._stop_requested = threading.Event()
+        self._pause_requested = threading.Event()
 
     @QtCore.pyqtSlot(float)
     def set_max_update_hz(self, max_update_hz):
@@ -201,6 +212,14 @@ class AcquisitionWorker(QtCore.QObject):
         """Store only the latest requested values for the acquisition loop."""
         with self._settings_lock:
             self._pending_camera_settings = dict(settings)
+
+    @QtCore.pyqtSlot(bool)
+    def set_paused(self, paused):
+        """This direct slot only changes thread-safe event state."""
+        if paused:
+            self._pause_requested.set()
+        else:
+            self._pause_requested.clear()
 
     @staticmethod
     def _numeric_feature_info(camera, name):
@@ -300,6 +319,11 @@ class AcquisitionWorker(QtCore.QObject):
                 with camera:
                     self.camera_controls_ready.emit(self._camera_control_info(camera))
                     while not self._stop_requested.is_set():
+                        while self._pause_requested.is_set():
+                            if self._stop_requested.wait(0.05):
+                                break
+                        if self._stop_requested.is_set():
+                            break
                         self._apply_pending_camera_settings(camera)
                         frame = camera.get_frame()
                         now = time.monotonic()
@@ -364,6 +388,76 @@ class AnalysisWorker(QtCore.QObject):
             self.error.emit(f"Frame analysis failed: {exc}")
 
 
+class ImageSaveWorker(QtCore.QObject):
+    """Serialize NPY writes and keep periodic saving from building a backlog."""
+
+    saved = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._condition = threading.Condition()
+        self._manual_jobs = deque()
+        self._latest_periodic_job = None
+        self._stopping = False
+
+    @QtCore.pyqtSlot(object)
+    def enqueue(self, job):
+        """Called directly; only enqueue immutable jobs under the condition lock."""
+        with self._condition:
+            if self._stopping:
+                return
+            if job.periodic:
+                self._latest_periodic_job = job
+            else:
+                self._manual_jobs.append(job)
+            self._condition.notify()
+
+    @QtCore.pyqtSlot()
+    def request_stop(self):
+        """Drop pending periodic work but finish every explicit manual save."""
+        with self._condition:
+            self._stopping = True
+            self._latest_periodic_job = None
+            self._condition.notify()
+
+    @QtCore.pyqtSlot()
+    def cancel_periodic(self):
+        with self._condition:
+            self._latest_periodic_job = None
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        try:
+            while True:
+                with self._condition:
+                    while (
+                        not self._manual_jobs
+                        and self._latest_periodic_job is None
+                        and not self._stopping
+                    ):
+                        self._condition.wait()
+
+                    if self._manual_jobs:
+                        job = self._manual_jobs.popleft()
+                    elif self._stopping:
+                        break
+                    else:
+                        job = self._latest_periodic_job
+                        self._latest_periodic_job = None
+
+                try:
+                    path = Path(job.path)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    np.save(str(path), job.frame, allow_pickle=False)
+                    self.saved.emit(job)
+                except Exception as exc:
+                    self.error.emit(f"Could not save {job.path}: {exc}")
+        finally:
+            self.finished.emit()
+
+
 class MplCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None, width=5, height=4, dpi=100):
         fig = Figure(figsize=(width, height), dpi=dpi)
@@ -376,7 +470,11 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
     analyze_requested = QtCore.pyqtSignal(object)
     acquisition_rate_changed = QtCore.pyqtSignal(float)
     camera_settings_changed = QtCore.pyqtSignal(object)
+    acquisition_pause_changed = QtCore.pyqtSignal(bool)
     acquisition_stop_requested = QtCore.pyqtSignal()
+    save_requested = QtCore.pyqtSignal(object)
+    periodic_save_cancel_requested = QtCore.pyqtSignal()
+    save_stop_requested = QtCore.pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -414,8 +512,12 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.discovery_thread = None
         self.discovery_worker = None
         self._auto_start_after_discovery = False
+        self._current_frame = None
+        self._periodic_save_deadline = None
+        self._save_sequence = 0
         self.RefGroupBox.setVisible(False)
         self._build_runtime_controls()
+        self._build_save_controls()
         self._start_workers()
 
     def _build_projection_layout(self):
@@ -474,6 +576,9 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.StartButton = QtWidgets.QPushButton("Start", controls)
         self.StopButton = QtWidgets.QPushButton("Stop", controls)
         self.StopButton.setEnabled(False)
+        self.PauseButton = QtWidgets.QPushButton("Pause", controls)
+        self.PauseButton.setCheckable(True)
+        self.PauseButton.setEnabled(False)
         self.CameraStatusLabel = QtWidgets.QLabel("Discovering cameras…", controls)
         self.CameraStatusLabel.setMinimumWidth(150)
 
@@ -541,7 +646,8 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         layout.addWidget(self.RefreshCamerasButton, 0, 4)
         layout.addWidget(self.StartButton, 0, 5)
         layout.addWidget(self.StopButton, 0, 6)
-        layout.addWidget(self.CameraStatusLabel, 0, 7)
+        layout.addWidget(self.PauseButton, 0, 7)
+        layout.addWidget(self.CameraStatusLabel, 0, 8)
         layout.addWidget(QtWidgets.QLabel("Display rate:"), 1, 0)
         layout.addWidget(self.UpdateRateSpinBox, 1, 1)
         layout.addWidget(QtWidgets.QLabel("Pixel size:"), 1, 2)
@@ -561,12 +667,13 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         layout.addWidget(self.BinningXSpinBox, 3, 3)
         layout.addWidget(QtWidgets.QLabel("Vertical binning:"), 3, 4)
         layout.addWidget(self.BinningYSpinBox, 3, 5)
-        layout.setColumnStretch(7, 1)
+        layout.setColumnStretch(8, 1)
         self.verticalLayout_8.insertWidget(0, controls)
 
         self.RefreshCamerasButton.clicked.connect(self._discover_cameras)
         self.StartButton.clicked.connect(self._start_acquisition)
         self.StopButton.clicked.connect(self._stop_acquisition)
+        self.PauseButton.toggled.connect(self._toggle_acquisition_pause)
         self.CameraComboBox.currentIndexChanged.connect(self._camera_changed)
         self.UpdateRateSpinBox.valueChanged.connect(self._update_rate_changed)
         self.PixelSizeSpinBox.valueChanged.connect(self._pixel_size_changed)
@@ -577,6 +684,43 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.BinningXSpinBox.valueChanged.connect(self._camera_settings_changed)
         self.BinningYSpinBox.valueChanged.connect(self._camera_settings_changed)
         self._update_rate_changed(self.UpdateRateSpinBox.value())
+
+    def _build_save_controls(self):
+        controls = QtWidgets.QGroupBox("NPY image saving", self.ImageGroupBox)
+        layout = QtWidgets.QGridLayout(controls)
+
+        self.PeriodicSaveCheckBox = QtWidgets.QCheckBox("Save periodically", controls)
+        self.SaveIntervalSpinBox = QtWidgets.QDoubleSpinBox(controls)
+        self.SaveIntervalSpinBox.setRange(0.1, 86400.0)
+        self.SaveIntervalSpinBox.setDecimals(1)
+        self.SaveIntervalSpinBox.setValue(10.0)
+        self.SaveIntervalSpinBox.setSuffix(" s")
+        self.SaveIntervalSpinBox.setToolTip("Elapsed time between saved image arrays.")
+        self.SaveDirectoryLineEdit = QtWidgets.QLineEdit(controls)
+        self.SaveDirectoryLineEdit.setText(str(Path.cwd() / "captures"))
+        self.SaveDirectoryLineEdit.setToolTip(
+            "Periodic images are written here as timestamped .npy files."
+        )
+        self.BrowseSaveDirectoryButton = QtWidgets.QPushButton("Browse…", controls)
+        self.SaveCurrentButton = QtWidgets.QPushButton("Save current image…", controls)
+        self.SaveCurrentButton.setEnabled(False)
+        self.SaveStatusLabel = QtWidgets.QLabel("No image saved yet", controls)
+
+        layout.addWidget(self.PeriodicSaveCheckBox, 0, 0)
+        layout.addWidget(QtWidgets.QLabel("Interval:"), 0, 1)
+        layout.addWidget(self.SaveIntervalSpinBox, 0, 2)
+        layout.addWidget(QtWidgets.QLabel("Folder:"), 0, 3)
+        layout.addWidget(self.SaveDirectoryLineEdit, 0, 4)
+        layout.addWidget(self.BrowseSaveDirectoryButton, 0, 5)
+        layout.addWidget(self.SaveCurrentButton, 0, 6)
+        layout.addWidget(self.SaveStatusLabel, 1, 0, 1, 7)
+        layout.setColumnStretch(4, 1)
+        self.verticalLayout_8.insertWidget(1, controls)
+
+        self.PeriodicSaveCheckBox.toggled.connect(self._periodic_save_changed)
+        self.SaveIntervalSpinBox.valueChanged.connect(self._periodic_save_changed)
+        self.BrowseSaveDirectoryButton.clicked.connect(self._browse_save_directory)
+        self.SaveCurrentButton.clicked.connect(self._save_current_image)
 
     def _set_camera_controls_enabled(self, enabled):
         for spin_box in (
@@ -646,7 +790,9 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
             spin_box.blockSignals(True)
             spin_box.setValue(value)
             spin_box.blockSignals(False)
-        self.CameraStatusLabel.setText("Running")
+        self.CameraStatusLabel.setText(
+            "Paused" if self.PauseButton.isChecked() else "Running"
+        )
 
     @QtCore.pyqtSlot(str)
     def _show_camera_warning(self, message):
@@ -673,7 +819,136 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.ImageView.setProperty("maxRedrawRate", max(1, round(value)))
         self.acquisition_rate_changed.emit(value)
 
+    @QtCore.pyqtSlot(bool)
+    def _toggle_acquisition_pause(self, paused):
+        running = (
+            self.acquisition_thread is not None
+            and self.acquisition_thread.isRunning()
+        )
+        if not running:
+            self.PauseButton.blockSignals(True)
+            self.PauseButton.setChecked(False)
+            self.PauseButton.blockSignals(False)
+            self.PauseButton.setText("Pause")
+            return
+        self.PauseButton.setText("Continue" if paused else "Pause")
+        self.CameraStatusLabel.setText("Paused" if paused else "Running")
+        self.acquisition_pause_changed.emit(paused)
+
+    def _periodic_save_changed(self, _value=None):
+        if self.PeriodicSaveCheckBox.isChecked():
+            self._periodic_save_deadline = (
+                time.monotonic() + self.SaveIntervalSpinBox.value()
+            )
+            self.SaveStatusLabel.setText("Periodic saving enabled")
+        else:
+            self._periodic_save_deadline = None
+            self.periodic_save_cancel_requested.emit()
+
+    @QtCore.pyqtSlot()
+    def _browse_save_directory(self):
+        current = Path(self.SaveDirectoryLineEdit.text()).expanduser()
+        start_directory = current if current.is_dir() else Path.cwd()
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select periodic image folder",
+            str(start_directory),
+        )
+        if directory:
+            self.SaveDirectoryLineEdit.setText(directory)
+
+    def _timestamped_save_path(self, directory):
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
+        milliseconds = now.microsecond // 1000
+        self._save_sequence += 1
+        filename = (
+            f"vimba_{timestamp}_{milliseconds:03d}_{self._save_sequence:06d}.npy"
+        )
+        return Path(directory) / filename
+
+    @QtCore.pyqtSlot()
+    def _save_current_image(self):
+        if self._current_frame is None:
+            self.SaveStatusLabel.setText("No image is available to save")
+            return
+        directory = Path(self.SaveDirectoryLineEdit.text()).expanduser()
+        if not directory.is_dir():
+            directory = Path.cwd()
+        suggested_path = self._timestamped_save_path(directory)
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save current image array",
+            str(suggested_path),
+            "NumPy array (*.npy)",
+        )
+        if not filename:
+            return
+        path = Path(filename)
+        if path.suffix.lower() != ".npy":
+            path = Path(str(path) + ".npy")
+        job = ImageSaveJob(self._current_frame.copy(), str(path), periodic=False)
+        self.save_requested.emit(job)
+        self.SaveStatusLabel.setText(f"Queued manual save: {path.name}")
+
+    def _maybe_save_periodically(self, frame):
+        if not self.PeriodicSaveCheckBox.isChecked():
+            return
+        now = time.monotonic()
+        if self._periodic_save_deadline is None:
+            self._periodic_save_deadline = now + self.SaveIntervalSpinBox.value()
+            return
+        if now < self._periodic_save_deadline:
+            return
+
+        interval = self.SaveIntervalSpinBox.value()
+        while self._periodic_save_deadline <= now:
+            self._periodic_save_deadline += interval
+        directory_text = self.SaveDirectoryLineEdit.text().strip()
+        if not directory_text:
+            self.PeriodicSaveCheckBox.setChecked(False)
+            self.SaveStatusLabel.setText("Periodic saving stopped: choose a folder")
+            return
+        path = self._timestamped_save_path(Path(directory_text).expanduser())
+        self.save_requested.emit(ImageSaveJob(frame.copy(), str(path), periodic=True))
+        self.SaveStatusLabel.setText(f"Queued periodic save: {path.name}")
+
+    @QtCore.pyqtSlot(object)
+    def _image_saved(self, job):
+        save_kind = "Periodic" if job.periodic else "Manual"
+        self.SaveStatusLabel.setText(f"{save_kind} save complete: {job.path}")
+
+    @QtCore.pyqtSlot(str)
+    def _image_save_failed(self, message):
+        self.SaveStatusLabel.setText(message)
+
     def _start_workers(self):
+        self.save_thread = QtCore.QThread(self)
+        self.save_worker = ImageSaveWorker()
+        self.save_worker.moveToThread(self.save_thread)
+        self.save_thread.started.connect(self.save_worker.run)
+        self.save_worker.saved.connect(self._image_saved)
+        self.save_worker.error.connect(self._image_save_failed)
+        self.save_worker.finished.connect(
+            self.save_thread.quit,
+            type=QtCore.Qt.DirectConnection,
+        )
+        self.save_worker.finished.connect(self.save_worker.deleteLater)
+        self.save_thread.finished.connect(self.save_thread.deleteLater)
+        self.save_requested.connect(
+            self.save_worker.enqueue,
+            type=QtCore.Qt.DirectConnection,
+        )
+        self.save_stop_requested.connect(
+            self.save_worker.request_stop,
+            type=QtCore.Qt.DirectConnection,
+        )
+        self.periodic_save_cancel_requested.connect(
+            self.save_worker.cancel_periodic,
+            type=QtCore.Qt.DirectConnection,
+        )
+        self.save_thread.start()
+
         self.analysis_thread = QtCore.QThread(self)
         self.analysis_worker = AnalysisWorker()
         self.analysis_worker.moveToThread(self.analysis_thread)
@@ -772,11 +1047,20 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
             self.acquisition_worker.request_stop,
             type=QtCore.Qt.DirectConnection,
         )
+        self.acquisition_pause_changed.connect(
+            self.acquisition_worker.set_paused,
+            type=QtCore.Qt.DirectConnection,
+        )
         self.camera_settings_changed.connect(
             self.acquisition_worker.queue_camera_settings,
             type=QtCore.Qt.DirectConnection,
         )
         self._set_camera_controls_enabled(False)
+        self.PauseButton.blockSignals(True)
+        self.PauseButton.setChecked(False)
+        self.PauseButton.blockSignals(False)
+        self.PauseButton.setText("Pause")
+        self.PauseButton.setEnabled(True)
         self.StartButton.setEnabled(False)
         self.StopButton.setEnabled(True)
         self.RefreshCamerasButton.setEnabled(False)
@@ -789,10 +1073,12 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         if self.acquisition_thread is not None and self.acquisition_thread.isRunning():
             self.CameraStatusLabel.setText("Stopping…")
             self.StopButton.setEnabled(False)
+            self.PauseButton.setEnabled(False)
             self.acquisition_stop_requested.emit()
         else:
             self.StartButton.setEnabled(True)
             self.StopButton.setEnabled(False)
+            self.PauseButton.setEnabled(False)
             self.CameraStatusLabel.setText("Stopped")
 
     @QtCore.pyqtSlot()
@@ -800,6 +1086,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         if self.acquisition_thread is not None and self.acquisition_thread.isRunning():
             self._restart_acquisition = True
             self.CameraStatusLabel.setText("Switching camera…")
+            self.PauseButton.setEnabled(False)
             self.acquisition_stop_requested.emit()
 
     @QtCore.pyqtSlot()
@@ -807,6 +1094,9 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         try:
             self.acquisition_rate_changed.disconnect(self.acquisition_worker.set_max_update_hz)
             self.acquisition_stop_requested.disconnect(self.acquisition_worker.request_stop)
+            self.acquisition_pause_changed.disconnect(
+                self.acquisition_worker.set_paused
+            )
             self.camera_settings_changed.disconnect(
                 self.acquisition_worker.queue_camera_settings
             )
@@ -816,6 +1106,11 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         self.acquisition_worker = None
         self.StartButton.setEnabled(True)
         self.StopButton.setEnabled(False)
+        self.PauseButton.blockSignals(True)
+        self.PauseButton.setChecked(False)
+        self.PauseButton.blockSignals(False)
+        self.PauseButton.setText("Pause")
+        self.PauseButton.setEnabled(False)
         self.RefreshCamerasButton.setEnabled(True)
         self._set_camera_controls_enabled(False)
         if self._restart_acquisition and not self._stopping:
@@ -839,6 +1134,9 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
         if self._stopping:
             return
 
+        self._current_frame = result.frame
+        self.SaveCurrentButton.setEnabled(True)
+        self._maybe_save_periodically(result.frame)
         self.ImageView.setImage(result.frame)
         self.left_plot_data.set_data(result.row_sum, result.row_pixel)
         self.top_plot_data.set_data(result.column_pixel, result.column_sum)
@@ -945,6 +1243,8 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
     def closeEvent(self, event):
         self._stopping = True
         self._pending_frame = None
+        self.PeriodicSaveCheckBox.setChecked(False)
+        self.save_stop_requested.emit()
         if self.acquisition_thread is not None and self.acquisition_thread.isRunning():
             self.acquisition_stop_requested.emit()
         self.analysis_thread.quit()
@@ -954,6 +1254,7 @@ class Viewer(DesignerDisplay, QtWidgets.QWidget):
             self.discovery_thread.quit()
             self.discovery_thread.wait(5000)
         self.analysis_thread.wait(5000)
+        self.save_thread.wait()
         super().closeEvent(event)
 
     # def add_menubar(self, widget: QtWidgets.QWidget):
